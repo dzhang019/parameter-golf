@@ -157,36 +157,80 @@ def load_state_dict(path: Path) -> tuple[dict[str, torch.Tensor], dict[str, Any]
     return state_dict, meta
 
 
-LAYER_PATTERN = re.compile(r"blocks\.(\d+)\.")
+LAYER_PATTERNS = [
+    re.compile(pattern)
+    for pattern in (
+        r"(?:^|\.)(?:blocks|layers|h)\.(\d+)(?:\.|$)",
+        r"(?:^|\.)(?:encoder|decoder)\.layers\.(\d+)(?:\.|$)",
+        r"(?:^|\.)(?:transformer|model)\.(?:h|layers)\.(\d+)(?:\.|$)",
+    )
+]
+
+GROUP_ORDER = [
+    "embedding",
+    "attn_q",
+    "attn_k",
+    "attn_v",
+    "attn_out",
+    "mlp_in",
+    "mlp_gate",
+    "mlp_out",
+    "norm",
+    "lm_head",
+    "skip",
+    "other",
+]
+
+
+def _endswith_any(name: str, suffixes: tuple[str, ...]) -> bool:
+    return any(name.endswith(suffix) for suffix in suffixes)
 
 
 def tensor_group(name: str) -> str:
-    if name == "tok_emb.weight":
+    lower = name.lower()
+    if _endswith_any(
+        lower,
+        (
+            "tok_emb.weight",
+            "token_embedding.weight",
+            "embed_tokens.weight",
+            "wte.weight",
+            "word_embeddings.weight",
+            "embeddings.word_embeddings.weight",
+        ),
+    ):
         return "embedding"
-    if name == "skip_weights":
+    if "skip_weight" in lower or "skip_weights" in lower:
         return "skip"
-    if ".attn.c_q.weight" in name:
+    if _endswith_any(lower, ("lm_head.weight", "output.weight", "embed_out.weight")):
+        return "lm_head"
+    if any(tag in lower for tag in ("norm.weight", "norm.scale", "rms_norm.weight", "layernorm.weight")):
+        return "norm"
+    if any(tag in lower for tag in (".attn.c_q", ".self_attn.q_proj", ".attention.q_proj", ".q_proj", ".wq", ".query")):
         return "attn_q"
-    if ".attn.c_k.weight" in name:
+    if any(tag in lower for tag in (".attn.c_k", ".self_attn.k_proj", ".attention.k_proj", ".k_proj", ".wk", ".key")):
         return "attn_k"
-    if ".attn.c_v.weight" in name:
+    if any(tag in lower for tag in (".attn.c_v", ".self_attn.v_proj", ".attention.v_proj", ".v_proj", ".wv", ".value")):
         return "attn_v"
-    if ".attn.proj.weight" in name:
+    if any(tag in lower for tag in (".attn.proj", ".self_attn.o_proj", ".attention.o_proj", ".out_proj", ".o_proj", ".wo")):
         return "attn_out"
-    if ".mlp.fc.weight" in name:
+    if any(tag in lower for tag in (".mlp.fc", ".mlp.up_proj", ".ffn.up_proj", ".fc1", ".w1")):
         return "mlp_in"
-    if ".mlp.proj.weight" in name:
+    if any(tag in lower for tag in (".mlp.gate_proj", ".ffn.gate_proj", ".gate_proj", ".w3")):
+        return "mlp_gate"
+    if any(tag in lower for tag in (".mlp.proj", ".mlp.down_proj", ".ffn.down_proj", ".fc2", ".w2")):
         return "mlp_out"
-    if ".resid_mix" in name:
-        return "resid_mix"
+    if "resid_mix" in lower:
+        return "skip"
     return "other"
 
 
 def extract_layer(name: str) -> int | None:
-    match = LAYER_PATTERN.search(name)
-    if match is None:
-        return None
-    return int(match.group(1))
+    for pattern in LAYER_PATTERNS:
+        match = pattern.search(name)
+        if match is not None:
+            return int(match.group(1))
+    return None
 
 
 def energy_rank(singular_values: torch.Tensor, frac: float) -> int:
@@ -335,7 +379,11 @@ def print_group_summary(group_summary: dict[str, dict[str, float]]) -> None:
 
 def print_layer_summary(layer_summary: dict[str, dict[str, dict[str, float]]]) -> None:
     print("\n== Layer Summary (rank_95_frac) ==")
-    header = ["layer", "attn_q", "attn_k", "attn_v", "attn_out", "mlp_in", "mlp_out"]
+    groups_present = sorted(
+        {group for layer_stats in layer_summary.values() for group in layer_stats},
+        key=lambda group: (GROUP_ORDER.index(group) if group in GROUP_ORDER else len(GROUP_ORDER), group),
+    )
+    header = ["layer", *groups_present]
     print(" ".join(f"{item:>10}" for item in header))
     for layer, stats in layer_summary.items():
         row = [layer]

@@ -35,6 +35,7 @@ class Hyperparameters:
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    save_models_by_run_id = bool(int(os.environ.get("SAVE_MODELS_BY_RUN_ID", "0")))
     seed = int(os.environ.get("SEED", 42))
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
@@ -199,7 +200,7 @@ def eval_val(args, model, rank, world_size, device, grad_accum_steps,
 
 # ── QUANTIZATION: Full GPTQ (Hessian-aware) + QAT-export alignment ──
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
-    p for p in "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,backout_lambda,bigram.scale,ve_layer_scales,ve_shared.scale,vrl_alphas,vrl_mid_alphas".split(",") if p)
+    p for p in "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,backout_lambda,bigram.scale,ve_layer_scales,ve_shared.scale,vrl_alphas,vrl_mid_alpha".split(",") if p)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 
@@ -549,11 +550,9 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
-    def make_x_in(self, x, x0):
-        mix = self.resid_mix.to(dtype=x.dtype)
-        return mix[0][None, None, :] * x + mix[1][None, None, :] * x0
     def forward(self, x, x0, v_embed=None, v_residual=None):
-        x_in = self.make_x_in(x, x0)
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed, v_residual=v_residual)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
@@ -565,8 +564,7 @@ class GPT(nn.Module):
                  rope_base, qk_gain_init, smear_enabled=True, backout_enabled=True, backout_init=0.2,
                  bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
                  rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10",
-                 vrl_mid_layer=-1):
+                 ve_enabled=False, ve_dim=128, ve_layers="9,10", vrl_mid_layer=-1):
         super().__init__()
         self.tie_embeddings, self.tied_embed_init_std = tie_embeddings, tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -602,20 +600,14 @@ class GPT(nn.Module):
         self.final_norm = RMSNorm()
         # v42: VRL — per-layer alpha for value residual from layer 0
         self.vrl_enabled = num_layers > 1
+        self.vrl_mid_layer = vrl_mid_layer if 0 < vrl_mid_layer < num_layers else -1
         if self.vrl_enabled:
             self.vrl_alphas = nn.ParameterList([
                 nn.Parameter(torch.tensor(0.0, dtype=torch.float32)) for _ in range(num_layers - 1)
             ])
         else:
             self.vrl_alphas = nn.ParameterList()
-        self.vrl_mid_layer = vrl_mid_layer if 0 < vrl_mid_layer < (num_layers - 1) else -1
-        if self.vrl_mid_layer >= 0:
-            self.vrl_mid_alphas = nn.ParameterList([
-                nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-                for _ in range(num_layers - self.vrl_mid_layer - 1)
-            ])
-        else:
-            self.vrl_mid_alphas = nn.ParameterList()
+        self.vrl_mid_alpha = nn.Parameter(torch.tensor(0.0, dtype=torch.float32)) if self.vrl_mid_layer >= 0 else None
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None: self.lm_head._zero_init = True
         self._init_weights()
@@ -646,48 +638,48 @@ class GPT(nn.Module):
         # v42: VRL — precompute layer 0's V projection
         # At layer 0, x == x0, so x_in = mix[0]*x0 + mix[1]*x0
         v0_raw = None
+        v_mid_raw = None
         if self.vrl_enabled:
             blk0 = self.blocks[0]
-            x_in0 = blk0.make_x_in(x0, x0)
+            mix0 = blk0.resid_mix.to(dtype=x0.dtype)
+            x_in0 = mix0[0][None, None, :] * x0 + mix0[1][None, None, :] * x0
             v0_raw = blk0.attn.c_v(blk0.attn_norm(x_in0) * blk0.ln_scale_factor)
         vrl_idx = 0
-        vrl_mid_idx = 0
-        v_mid_raw = None
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            blk = self.blocks[i]
             if i == self.vrl_mid_layer:
-                x_in_mid = blk.make_x_in(x, x0)
-                v_mid_raw = blk.attn.c_v(blk.attn_norm(x_in_mid) * blk.ln_scale_factor)
+                blk_mid = self.blocks[i]
+                mix_mid = blk_mid.resid_mix.to(dtype=x.dtype)
+                x_in_mid = mix_mid[0][None, None, :] * x + mix_mid[1][None, None, :] * x0
+                v_mid_raw = blk_mid.attn.c_v(blk_mid.attn_norm(x_in_mid) * blk_mid.ln_scale_factor)
             v_res = None
             if i > 0 and v0_raw is not None:
                 alpha = torch.sigmoid(self.vrl_alphas[vrl_idx].to(dtype=x.dtype))
                 v_res = alpha * v0_raw
                 vrl_idx += 1
-            if i > self.vrl_mid_layer >= 0 and v_mid_raw is not None:
-                alpha_mid = torch.sigmoid(self.vrl_mid_alphas[vrl_mid_idx].to(dtype=x.dtype))
-                v_res = alpha_mid * v_mid_raw if v_res is None else v_res + alpha_mid * v_mid_raw
-                vrl_mid_idx += 1
-            x = blk(x, x0, v_embed=ve, v_residual=v_res); skips.append(x)
+            if i > self.vrl_mid_layer and v_mid_raw is not None and self.vrl_mid_alpha is not None:
+                mid_alpha = torch.sigmoid(self.vrl_mid_alpha.to(dtype=x.dtype))
+                v_res = (mid_alpha * v_mid_raw) if v_res is None else (v_res + mid_alpha * v_mid_raw)
+            x = self.blocks[i](x, x0, v_embed=ve, v_residual=v_res); skips.append(x)
             if i == backout_layer: x_backout = x
         for i in range(self.num_decoder_layers):
             li = self.num_encoder_layers + i
             if skips: x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(li, input_ids, ve_cache)
-            blk = self.blocks[li]
             if li == self.vrl_mid_layer:
-                x_in_mid = blk.make_x_in(x, x0)
-                v_mid_raw = blk.attn.c_v(blk.attn_norm(x_in_mid) * blk.ln_scale_factor)
+                blk_mid = self.blocks[li]
+                mix_mid = blk_mid.resid_mix.to(dtype=x.dtype)
+                x_in_mid = mix_mid[0][None, None, :] * x + mix_mid[1][None, None, :] * x0
+                v_mid_raw = blk_mid.attn.c_v(blk_mid.attn_norm(x_in_mid) * blk_mid.ln_scale_factor)
             v_res = None
             if v0_raw is not None:
                 alpha = torch.sigmoid(self.vrl_alphas[vrl_idx].to(dtype=x.dtype))
                 v_res = alpha * v0_raw
                 vrl_idx += 1
-            if li > self.vrl_mid_layer >= 0 and v_mid_raw is not None:
-                alpha_mid = torch.sigmoid(self.vrl_mid_alphas[vrl_mid_idx].to(dtype=x.dtype))
-                v_res = alpha_mid * v_mid_raw if v_res is None else v_res + alpha_mid * v_mid_raw
-                vrl_mid_idx += 1
-            x = blk(x, x0, v_embed=ve, v_residual=v_res)
+            if li > self.vrl_mid_layer and v_mid_raw is not None and self.vrl_mid_alpha is not None:
+                mid_alpha = torch.sigmoid(self.vrl_mid_alpha.to(dtype=x.dtype))
+                v_res = (mid_alpha * v_mid_raw) if v_res is None else (v_res + mid_alpha * v_mid_raw)
+            x = self.blocks[li](x, x0, v_embed=ve, v_residual=v_res)
             if li == backout_layer and x_backout is None: x_backout = x
         if self.backout_lambda is not None and x_backout is not None:
             x = x - self.backout_lambda.to(x.dtype) * x_backout
@@ -829,8 +821,7 @@ def main():
         smear_enabled=args.smear_enabled, backout_enabled=args.backout_enabled, backout_init=args.backout_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        vrl_mid_layer=args.vrl_mid_layer,
+        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers, vrl_mid_layer=args.vrl_mid_layer,
     ).to(device).bfloat16()
     for m in base_model.modules():
         if isinstance(m, CastedLinear): m.float()
@@ -851,7 +842,7 @@ def main():
     # v42: VRL alphas
     if base_model.vrl_enabled:
         for a in base_model.vrl_alphas: scalar_params.append(a)
-        for a in base_model.vrl_mid_alphas: scalar_params.append(a)
+    if base_model.vrl_mid_alpha is not None: scalar_params.append(base_model.vrl_mid_alpha)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_param_groups = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
@@ -1039,7 +1030,13 @@ def main():
     if total_size > size_limit: log0(f"WARNING: Total size {total_size} exceeds 16MB limit by {total_size - size_limit} bytes!")
     else: log0(f"Size OK: {total_size/1e6:.2f} MB")
     if master_process:
+        torch.save(base_model.state_dict(), "final_model.pt")
         with open("final_model.int6.ptz", "wb") as f: f.write(model_blob)
+        if args.save_models_by_run_id:
+            os.makedirs("models", exist_ok=True)
+            torch.save(base_model.state_dict(), f"models/{args.run_id}_final_model.pt")
+            with open(f"models/{args.run_id}_final_model.int6.ptz", "wb") as f:
+                f.write(model_blob)
     if distributed: dist.barrier()
     # ROUNDTRIP DEQUANTIZE
     with open("final_model.int6.ptz", "rb") as f: model_blob_loaded = f.read()
